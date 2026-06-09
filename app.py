@@ -1,5 +1,5 @@
 import streamlit as st
-import youtube_transcript_api as yta
+import youtube_transcript_api as yta # 모듈 전체를 별칭으로 안전하게 가져옴
 import re
 from collections import Counter
 import eng_to_ipa as ipa
@@ -11,111 +11,105 @@ from streamlit_mic_recorder import mic_recorder
 import speech_recognition as sr
 from difflib import SequenceMatcher
 
-# --- 리소스 및 NLTK 설정 ---
+# --- 리소스 설정 ---
 @st.cache_resource
-def setup_resources():
+def download_nltk():
     nltk.download('stopwords', quiet=True)
     nltk.download('punkt', quiet=True)
-    return True
 
-setup_resources()
+download_nltk()
 
 def get_video_id(url):
-    """유튜브 URL에서 비디오 ID 추출"""
-    regex = r"(?:v=|\/)([0-9A-Za-z_-]{11}).*"
-    match = re.search(regex, url)
+    pattern = r"(?:v=|\/)([0-9A-Za-z_-]{11}).*"
+    match = re.search(pattern, url)
     return match.group(1) if match else None
 
-def get_accuracy_score(original, recorded):
-    """텍스트 유사도를 통한 발음 정확도 측정 (0-100%)"""
-    orig = re.sub(r'[^\w\s]', '', original.lower()).strip()
-    user = re.sub(r'[^\w\s]', '', recorded.lower()).strip()
-    return int(SequenceMatcher(None, orig, user).ratio() * 100)
-
-def play_voice(text):
-    """Google TTS를 이용한 원어민 발음 생성"""
+def get_tts_audio(text):
     tts = gTTS(text=text, lang='en')
     audio_fp = io.BytesIO()
     tts.write_to_fp(audio_fp)
     audio_fp.seek(0)
     return audio_fp
 
-# --- Streamlit UI 시작 ---
-st.set_page_config(page_title="AI 영어 발음 학습기", layout="wide")
+def calculate_accuracy(original, recorded):
+    # 정규화: 소문자화 및 특수문자 제거
+    orig_clean = re.sub(r'[^\w\s]', '', original.lower()).strip()
+    user_clean = re.sub(r'[^\w\s]', '', recorded.lower()).strip()
+    # 문자열 유사도 기반 점수 산출
+    ratio = SequenceMatcher(None, orig_clean, user_clean).ratio()
+    return int(ratio * 100)
+
+# --- UI 레이아웃 ---
+st.set_page_config(page_title="AI 유튜브 영어 학습", layout="wide")
 st.title("📺 AI 유튜브 영어 발음 교정 서비스")
-st.info("유튜브 영상의 자막을 분석하여 핵심 표현을 배우고 발음 정확도를 체크합니다.")
+st.info("유튜브 영상의 자막을 분석하여 핵심 표현을 추출하고 발음 정확도를 체크합니다.")
 
-url_input = st.text_input("유튜브 영상 주소 (URL)를 입력하세요:", value="https://www.youtube.com/watch?v=M7BWHPtV1qM")
+url = st.text_input("유튜브 영상 주소를 입력하세요 (한국어 가이드 -> 영어 학습 순):", 
+                   value="https://www.youtube.com/watch?v=M7BWHPtV1qM")
 
-if url_input:
-    video_id = get_video_id(url_input)
+if url:
+    video_id = get_video_id(url)
     if not video_id:
-        st.error("올바른 유튜브 주소를 입력해 주세요.")
+        st.error("유효하지 않은 유튜브 주소입니다.")
     else:
         try:
-            # [해결책] AttributeError 방지를 위한 모듈 직접 접근 방식
-            # YouTubeTranscriptApi 클래스 내의 get_transcript 메서드를 직접 호출합니다.
-            if hasattr(yta, 'YouTubeTranscriptApi'):
-                transcript = yta.YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
-            else:
-                # 만약 클래스 참조가 실패할 경우 모듈 수준에서 다시 시도
-                st.error("라이브러리 로드 오류가 발생했습니다. 저장소를 다시 빌드해 주세요.")
-                st.stop()
+            # [해결 포인트] 가장 명시적인 경로로 메서드 호출 (AttributeError 방지)
+            transcript_data = yta.YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
             
-            # 자막 분석 (단어 10개, 문장 10개)
-            full_text = " ".join([t['text'] for t in transcript])
+            # 분석: 단어 및 문장 추출
+            full_text = " ".join([t['text'] for t in transcript_data])
             words = re.findall(r'\b\w+\b', full_text.lower())
             stop_words = set(stopwords.words('english'))
             
-            # 중요 단어 10개 (불용어 제외, 4글자 이상)
-            common_words = [w for w, c in Counter(words).most_common(100) if w not in stop_words and len(w) > 3][:10]
+            # 중요 단어 10개 (길이 4자 이상, 불용어 제외)
+            top_words = [w for w, c in Counter(words).most_common(100) if w not in stop_words and len(w) > 3][:10]
             
-            # 주요 문장 10개 (길이가 적당한 문장 위주)
-            common_sentences = [t['text'].replace('\n', ' ') for t in transcript if 8 < len(t['text'].split()) < 15][:10]
+            # 중요 문장 10개 (적당한 길이의 문장 추출)
+            top_sentences = [t['text'].replace('\n', ' ') for t in transcript_data if 8 < len(t['text'].split()) < 15][:10]
 
             st.divider()
-            word_col, sent_col = st.columns(2)
+            col1, col2 = st.columns(2)
 
-            with word_col:
-                st.header("🔤 핵심 단어 학습")
-                st.caption("발음기호 확인 -> 원어민 발음 듣기 -> 내 발음 녹음 순서")
-                for i, word in enumerate(common_words):
+            with col1:
+                st.header("🔑 핵심 단어 학습")
+                st.write("단어를 확인하고 원어민 발음을 들은 뒤 따라해보세요.")
+                for i, word in enumerate(top_words):
                     with st.expander(f"{i+1}. {word.upper()}"):
                         st.write(f"**발음기호:** [{ipa.convert(word)}]")
-                        st.audio(play_voice(word), format="audio/mp3")
+                        st.audio(get_tts_audio(word), format="audio/mp3")
                         
-                        st.write("🎙️ 따라해 보세요:")
-                        record = mic_recorder(key=f"word_{i}", start_prompt="녹음 시작", stop_prompt="중지")
-                        if record:
+                        st.write("🎙️ 발음을 녹음하세요:")
+                        rec = mic_recorder(key=f"word_{i}", start_prompt="녹음 시작", stop_prompt="중지")
+                        if rec:
                             recognizer = sr.Recognizer()
-                            with sr.AudioFile(io.BytesIO(record['bytes'])) as source:
+                            with sr.AudioFile(io.BytesIO(rec['bytes'])) as source:
                                 audio = recognizer.record(source)
                                 try:
-                                    speech_text = recognizer.recognize_google(audio, language='en-US')
-                                    score = get_accuracy_score(word, speech_text)
-                                    st.write(f"인식 결과: **{speech_text}**")
-                                    st.metric("발음 정확도", f"{score}%")
+                                    user_text = recognizer.recognize_google(audio, language='en-US')
+                                    score = calculate_accuracy(word, user_text)
+                                    st.write(f"인식 결과: **{user_text}**")
+                                    st.metric("정확도 점수", f"{score}%")
                                     st.progress(score / 100)
                                 except:
-                                    st.error("인식에 실패했습니다. 다시 시도해 주세요.")
+                                    st.error("발음이 명확하지 않습니다. 다시 시도해주세요.")
 
-            with sent_col:
+            with col2:
                 st.header("📝 주요 문장 학습")
-                st.caption("문장 전체를 듣고 정확한 호흡과 인토네이션을 연습하세요.")
-                for i, sent in enumerate(common_sentences):
-                    st.info(f"Sentence {i+1}: {sent}")
-                    st.audio(play_voice(sent), format="audio/mp3")
+                st.write("문장 전체의 인토네이션과 호흡을 연습해보세요.")
+                for i, sent in enumerate(top_sentences):
+                    st.info(f"문장 {i+1}: {sent}")
+                    st.audio(get_tts_audio(sent), format="audio/mp3")
                     
-                    record_s = mic_recorder(key=f"sent_{i}", start_prompt="🎙️ 문장 연습 시작", stop_prompt="완료")
-                    if record_s:
+                    rec_s = mic_recorder(key=f"sent_{i}", start_prompt="🎙️ 문장 연습", stop_prompt="완료")
+                    if rec_s:
                         recognizer = sr.Recognizer()
-                        with sr.AudioFile(io.BytesIO(record_s['bytes'])) as source:
+                        with sr.AudioFile(io.BytesIO(rec_s['bytes'])) as source:
                             audio = recognizer.record(source)
                             try:
-                                speech_text = recognizer.recognize_google(audio, language='en-US')
-                                score = get_accuracy_score(sent, speech_text)
-                                st.write(f"인식 결과: **{speech_text}**")
-                                st.write(f"종합 정확도 점수: **{score}%**")
+                                user_text = recognizer.recognize_google(audio, language='en-US')
+                                score = calculate_accuracy(sent, user_text)
+                                st.write(f"인식 결과: **{user_text}**")
+                                st.write(f"정확도: **{score}%**")
                                 st.progress(score / 100)
                             except:
                                 st.error("음성을 인식할 수 없습니다.")
@@ -123,5 +117,4 @@ if url_input:
 
         except Exception as e:
             st.error(f"오류가 발생했습니다: {e}")
-            st.warning("영상의 자막 설정이 되어 있는지, 또는 라이브러리가 정상 설치되었는지 확인해 주세요.")
-
+            st.warning("영상의 자막 설정이 되어 있는지 확인해 주세요.")
