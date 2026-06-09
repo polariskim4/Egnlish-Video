@@ -1,5 +1,6 @@
 streamlit
 youtube-transcript-api==0.6.2
+setuptools
 nltk
 gTTS
 eng-to-ipa
