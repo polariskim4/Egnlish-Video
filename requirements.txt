@@ -5,10 +5,3 @@ gTTS
 eng-to-ipa
 streamlit-mic-recorder
 SpeechRecognition
-streamlit
-youtube-transcript-api
-nltk
-gTTS
-eng-to-ipa
-streamlit-mic-recorder
-SpeechRecognition
