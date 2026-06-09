@@ -1,3 +1,9 @@
+import nltk
+nltk.download('stopwords')
+nltk.download('punkt')
+import nltk
+nltk.download('stopwords')
+nltk.download('punkt')
 import streamlit as st
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
