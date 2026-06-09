@@ -113,10 +113,3 @@ if url:
 
     except Exception as e:
         st.error(f"오류가 발생했습니다: {e}")
-streamlit
-youtube-transcript-api
-nltk
-gTTS
-eng-to-ipa
-streamlit-mic-recorder
-SpeechRecognition
