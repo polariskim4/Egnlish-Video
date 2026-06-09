@@ -1,8 +1,3 @@
-import nltk
-
-# 처음 한 번만 실행하면 됩니다.
-nltk.download('stopwords')
-nltk.download('punkt')
 import streamlit as st
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 import re
@@ -16,100 +11,93 @@ from streamlit_mic_recorder import mic_recorder
 import speech_recognition as sr
 from difflib import SequenceMatcher
 
-# NLTK 데이터 다운로드 (최초 실행 시 필요)
+# --- 초기 설정 및 캐싱 ---
 @st.cache_resource
-def load_nltk_resources():
-    nltk.download('stopwords')
-    nltk.download('punkt')
+def init_nltk():
+    try:
+        nltk.download('stopwords')
+        nltk.download('punkt')
+    except:
+        pass
 
-load_nltk_resources()
+init_nltk()
 
-# --- 비즈니스 로직 함수 ---
-
-def extract_video_id(url):
-    """유튜브 URL에서 11자리 비디오 ID 추출"""
+def get_video_id(url):
     pattern = r"(?:v=|\/)([0-9A-Za-z_-]{11}).*"
     match = re.search(pattern, url)
     return match.group(1) if match else None
 
-def get_transcript_safe(video_id):
-    """자막을 안전하게 가져오며 예외 상황을 처리"""
-    try:
-        # 정적 메서드 호출 방식 준수
-        return YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
-    except TranscriptsDisabled:
-        st.error("이 영상은 자막 기능이 비활성화되어 있습니다.")
-    except NoTranscriptFound:
-        st.error("영어 자막을 찾을 수 없습니다.")
-    except Exception as e:
-        st.error(f"자막 로드 중 알 수 없는 오류 발생: {e}")
-    return None
-
-def analyze_text(transcript_data):
-    """단어 10개와 문장 10개 추출"""
-    full_text = " ".join([t['text'] for t in transcript_data])
-    
-    # 단어 추출 (불용어 제거 및 정제)
-    words = re.findall(r'\b\w+\b', full_text.lower())
-    stop_words = set(stopwords.words('english'))
-    important_words = [w for w, c in Counter(words).most_common(50) if w not in stop_words and len(w) > 3][:10]
-    
-    # 문장 추출 (가독성 좋은 길이 기준)
-    sentences = [t['text'].replace('\n', ' ') for t in transcript_data if 6 < len(t['text'].split()) < 15][:10]
-    
-    return important_words, sentences
-
-def calculate_score(original, recorded):
-    """발음 정확도 계산"""
+def calculate_accuracy(original, user_input):
     original_clean = re.sub(r'[^\w\s]', '', original.lower()).strip()
-    recorded_clean = re.sub(r'[^\w\s]', '', recorded.lower()).strip()
-    return int(SequenceMatcher(None, original_clean, recorded_clean).ratio() * 100)
+    user_input_clean = re.sub(r'[^\w\s]', '', user_input.lower()).strip()
+    return int(SequenceMatcher(None, original_clean, user_input_clean).ratio() * 100)
 
 # --- UI 레이아웃 ---
+st.set_page_config(page_title="유튜브 영어 학습기", layout="wide")
+st.title("📺 AI 유튜브 영어 학습 매니저")
+st.info("유튜브 주소를 입력하면 핵심 단어와 문장을 추출하고 발음을 교정해줍니다.")
 
-st.set_page_config(page_title="AI 영어 학습 매니저", layout="wide")
-st.title("📺 YouTube 영어 학습 매니저")
-st.markdown("유튜브 주소를 입력해 핵심 표현을 배우고 발음을 교정해보세요.")
+# 사이드바에 사용법 안내
+with st.sidebar:
+    st.header("💡 사용법")
+    st.write("1. 유튜브 URL 입력")
+    st.write("2. 핵심 단어/문장 확인")
+    st.write("3. 스피커로 발음 듣기")
+    st.write("4. 마이크로 따라하며 점수 확인")
 
-url = st.text_input("학습할 유튜브 영상 주소를 입력하세요:", value="https://www.youtube.com/watch?v=jhEtBuuYNj4")
+url = st.text_input("학습할 유튜브 주소 입력:", value="https://www.youtube.com/watch?v=jhEtBuuYNj4")
 
 if url:
-    video_id = extract_video_id(url)
-    if video_id:
-        transcript_data = get_transcript_safe(video_id)
-        
-        if transcript_data:
-            words, sentences = analyze_text(transcript_data)
+    v_id = get_video_id(url)
+    if v_id:
+        try:
+            # 자막 데이터 로드 (클래스 메서드 직접 호출)
+            transcript_list = YouTubeTranscriptApi.get_transcript(v_id, languages=['en'])
             
-            tab1, tab2 = st.tabs(["🔑 중요 단어 10", "📝 주요 문장 10"])
+            # 텍스트 분석
+            full_text = " ".join([t['text'] for t in transcript_list])
+            words = re.findall(r'\b\w+\b', full_text.lower())
+            stop_words = set(stopwords.words('english'))
             
-            with tab1:
-                for i, word in enumerate(words):
-                    col_info, col_audio, col_rec = st.columns([3, 2, 5])
-                    with col_info:
-                        st.subheader(f"{i+1}. {word}")
-                        st.write(f"[{ipa.convert(word)}]")
-                    with col_audio:
+            # 중요 단어 10개 추출
+            important_words = [w for w, c in Counter(words).most_common(100) if w not in stop_words and len(w) > 3][:10]
+            
+            # 중요 문장 10개 추출
+            important_sentences = [t['text'].replace('\n', ' ') for t in transcript_list if 7 < len(t['text'].split()) < 15][:10]
+
+            st.divider()
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.header("🔤 핵심 단어")
+                for i, word in enumerate(important_words):
+                    with st.expander(f"{i+1}. {word.upper()}"):
+                        st.write(f"**발음기호:** [{ipa.convert(word)}]")
+                        
+                        # TTS
                         tts = gTTS(text=word, lang='en')
                         fp = io.BytesIO()
                         tts.write_to_fp(fp)
                         st.audio(fp, format="audio/mp3")
-                    with col_rec:
-                        rec = mic_recorder(key=f"w_{i}", start_prompt="🎙️ 따라하기", stop_prompt="⏹️ 중지")
+                        
+                        # 녹음
+                        rec = mic_recorder(key=f"w_{i}", start_prompt="🎙️ 따라하기", stop_prompt="⏹️ 완료")
                         if rec:
                             recognizer = sr.Recognizer()
                             with sr.AudioFile(io.BytesIO(rec['bytes'])) as source:
                                 audio = recognizer.record(source)
                                 try:
                                     user_speech = recognizer.recognize_google(audio, language='en-US')
-                                    score = calculate_score(word, user_speech)
-                                    st.write(f"인식 결과: **{user_speech}** (정확도: {score}%)")
+                                    score = calculate_accuracy(word, user_speech)
+                                    st.write(f"인식: **{user_speech}**")
+                                    st.metric("정확도", f"{score}%")
                                     st.progress(score / 100)
                                 except:
-                                    st.warning("발음을 인식하지 못했습니다.")
+                                    st.error("인식 실패. 다시 해보세요!")
 
-            with tab2:
-                for i, sent in enumerate(sentences):
+            with col2:
+                st.header("📝 주요 문장")
+                for i, sent in enumerate(important_sentences):
                     st.info(f"Sentence {i+1}: {sent}")
                     tts_s = gTTS(text=sent, lang='en')
                     fp_s = io.BytesIO()
@@ -118,8 +106,23 @@ if url:
                     
                     rec_s = mic_recorder(key=f"s_{i}", start_prompt="🎙️ 문장 연습", stop_prompt="⏹️ 완료")
                     if rec_s:
-                        # 문장 점수 계산 로직 (단어와 동일)
-                        pass
+                        recognizer = sr.Recognizer()
+                        with sr.AudioFile(io.BytesIO(rec_s['bytes'])) as source:
+                            audio = recognizer.record(source)
+                            try:
+                                user_speech = recognizer.recognize_google(audio, language='en-US')
+                                score = calculate_accuracy(sent, user_speech)
+                                st.write(f"인식: **{user_speech}** (정확도: {score}%)")
+                                st.progress(score / 100)
+                            except:
+                                st.error("음성 인식에 실패했습니다.")
                     st.divider()
+
+        except TranscriptsDisabled:
+            st.error("이 영상은 자막이 비활성화되어 있습니다.")
+        except NoTranscriptFound:
+            st.error("영어 자막을 찾을 수 없습니다.")
+        except Exception as e:
+            st.error(f"오류가 발생했습니다: {e}")
     else:
-        st.error("URL에서 비디오 ID를 추출할 수 없습니다.")
+        st.warning("유효한 유튜브 주소를 입력하세요.")
