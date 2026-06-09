@@ -1,5 +1,12 @@
 streamlit
-youtube-transcript-api==0.6.2
+youtube-transcript-api
+nltk
+gTTS
+eng-to-ipa
+streamlit-mic-recorder
+SpeechRecognition
+streamlit
+youtube-transcript-api
 nltk
 gTTS
 eng-to-ipa
