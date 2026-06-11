@@ -218,6 +218,8 @@ def analyze_with_claude(transcript: str) -> tuple[list[dict], list[dict], str]:
     MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
     import time
 
+    last_err = "알 수 없는 오류"  # UnboundLocalError 방지
+
     for model in MODELS:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -227,17 +229,18 @@ def analyze_with_claude(transcript: str) -> tuple[list[dict], list[dict], str]:
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.2},
         }
-        for attempt in range(3):   # 같은 모델 최대 3회 재시도
+        for attempt in range(3):
             try:
                 r = requests.post(url, json=payload, timeout=60)
                 if r.status_code == 429:
-                    # Retry-After 헤더 확인, 없으면 지수 대기
                     wait = int(r.headers.get("Retry-After", 2 ** (attempt + 1)))
-                    wait = min(wait, 30)   # 최대 30초
+                    wait = min(wait, 30)
+                    last_err = f"{model}: 429 한도 초과, {wait}초 대기"
                     time.sleep(wait)
-                    continue               # 같은 모델 재시도
+                    continue
                 if r.status_code == 404:
-                    break                  # 모델 없음 → 다음 모델로
+                    last_err = f"{model}: 404 모델 없음"
+                    break
                 r.raise_for_status()
                 raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                 raw = re.sub(r"^```[a-z]*", "", raw)
@@ -245,12 +248,11 @@ def analyze_with_claude(transcript: str) -> tuple[list[dict], list[dict], str]:
                 data = json.loads(raw)
                 return data.get("words", []), data.get("sentences", []), ""
             except Exception as e:
-                last_err = str(e)
+                last_err = f"{model} 시도{attempt+1}: {e}"
                 if attempt < 2:
                     time.sleep(2 ** attempt)
-                continue
 
-    return [], [], f"모든 모델 실패: {last_err}"
+    return [], [], f"모든 모델 실패 — {last_err}"
 
 # ── 인터랙티브 컴포넌트 HTML 생성 ────────────────────────────────────────────
 def build_component_html(words: list[dict], sentences: list[dict], video_id: str) -> str:
