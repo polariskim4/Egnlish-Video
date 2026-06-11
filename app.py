@@ -30,62 +30,135 @@ def extract_video_id(url: str) -> str | None:
             return m.group(1)
     return None
 
+# ── VTT 파싱 헬퍼 ────────────────────────────────────────────────────────────
+def parse_vtt_text(raw: str) -> str:
+    lines = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or "-->" in line or line.startswith("WEBVTT") or re.match(r"^\d+$", line):
+            continue
+        line = re.sub(r"<[^>]+>", "", line)
+        line = re.sub(r"&amp;", "&", line)
+        if line:
+            lines.append(line)
+    # 중복 줄 제거 (자동자막 중복 많음)
+    seen, deduped = set(), []
+    for l in lines:
+        if l not in seen:
+            seen.add(l); deduped.append(l)
+    return " ".join(deduped)
+
 # ── 자막 취득 ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_transcript(video_id: str) -> tuple[str, str]:
-    # 방법 1: yt-dlp
+def get_transcript(video_id: str) -> tuple[str, str, str]:
+    """(text, method, error_detail) 반환"""
+    errors = []
+
+    # ── 방법 1: youtube-transcript-api (가장 가벼움, Streamlit Cloud에서 잘 됨)
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+        tl = YouTubeTranscriptApi.list_transcripts(video_id)
+        # 수동 영어 자막 우선
+        for lang in ["en", "en-US", "en-GB"]:
+            try:
+                segs = tl.find_transcript([lang]).fetch()
+                text = " ".join(s["text"] for s in segs)
+                if len(text) > 100:
+                    return text, "transcript-api (수동자막)", ""
+            except Exception:
+                pass
+        # 자동생성 자막
+        for t in tl:
+            if t.language_code.startswith("en"):
+                segs = t.fetch()
+                text = " ".join(s["text"] for s in segs)
+                if len(text) > 100:
+                    return text, f"transcript-api (자동:{t.language_code})", ""
+        errors.append("transcript-api: 영어 자막 없음")
+    except Exception as e:
+        errors.append(f"transcript-api: {e}")
+
+    # ── 방법 2: yt-dlp (User-Agent + android client 우회)
     try:
         import yt_dlp, tempfile, os, glob
+        tmp = tempfile.mkdtemp()
         opts = {
-            "skip_download": True, "writeautomaticsub": True,
-            "writesubtitles": True, "subtitleslangs": ["en","en-US","en-GB"],
+            "skip_download": True,
+            "writeautomaticsub": True,
+            "writesubtitles": True,
+            "subtitleslangs": ["en", "en-US", "en-GB"],
             "subtitlesformat": "vtt",
-            "outtmpl": tempfile.gettempdir() + "/yt_sub_%(id)s.%(ext)s",
+            "outtmpl": os.path.join(tmp, "sub_%(id)s.%(ext)s"),
             "quiet": True, "no_warnings": True,
-            "http_headers": {"User-Agent":
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"},
-            "extractor_args": {"youtube": {"player_client": ["web","android"]}},
+            "socket_timeout": 30,
+            "http_headers": {
+                "User-Agent": (
+                    "com.google.android.youtube/19.09.37 "
+                    "(Linux; U; Android 11) gzip"
+                )
+            },
+            "extractor_args": {
+                "youtube": {"player_client": ["android", "web"]}
+            },
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
-        vtt_files = glob.glob(tempfile.gettempdir() + f"/yt_sub_{video_id}*.vtt")
+        vtt_files = glob.glob(os.path.join(tmp, f"sub_{video_id}*.vtt"))
         if vtt_files:
-            lines = []
-            with open(vtt_files[0], encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or "-->" in line or line.startswith("WEBVTT") or re.match(r"^\d+$", line):
-                        continue
-                    lines.append(re.sub(r"<[^>]+>", "", line))
-            for fv in vtt_files:
+            raw = open(vtt_files[0], encoding="utf-8").read()
+            text = parse_vtt_text(raw)
+            for fv in glob.glob(os.path.join(tmp, "*")):
                 try: os.remove(fv)
                 except: pass
-            text = " ".join(lines)
             if len(text) > 100:
-                return text, "yt-dlp"
-    except Exception:
-        pass
+                return text, "yt-dlp", ""
+        errors.append("yt-dlp: VTT 파일 없음")
+    except Exception as e:
+        errors.append(f"yt-dlp: {e}")
 
-    # 방법 2: youtube-transcript-api
+    # ── 방법 3: Supadata 무료 API (서드파티, 별도 인증 불필요)
     try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-        tl = YouTubeTranscriptApi.list_transcripts(video_id)
-        for lang in ["en","en-US","en-GB"]:
-            try:
-                data = tl.find_transcript([lang]).fetch()
-                return " ".join(d["text"] for d in data), "transcript-api"
-            except Exception:
-                pass
-        for t in tl:
-            if t.language_code.startswith("en"):
-                data = t.fetch()
-                return " ".join(d["text"] for d in data), "auto-caption"
-    except Exception:
-        pass
+        import requests
+        r = requests.get(
+            "https://api.supadata.ai/v1/youtube/transcript",
+            params={"videoId": video_id, "lang": "en"},
+            timeout=20,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            # content 는 list[{text}] 또는 str
+            content = data.get("content", data.get("transcript", ""))
+            if isinstance(content, list):
+                text = " ".join(c.get("text","") for c in content)
+            else:
+                text = str(content)
+            if len(text) > 100:
+                return text, "supadata-api", ""
+        errors.append(f"supadata: HTTP {r.status_code}")
+    except Exception as e:
+        errors.append(f"supadata: {e}")
 
-    return "", "failed"
+    # ── 방법 4: YouTubeTranscript.io 무료 엔드포인트
+    try:
+        import requests
+        r = requests.get(
+            f"https://youtubetranscript.com/?server_vid2={video_id}",
+            timeout=20,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if r.status_code == 200 and "<text" in r.text:
+            texts = re.findall(r"<text[^>]*>(.*?)</text>", r.text, re.DOTALL)
+            text = " ".join(
+                re.sub(r"&[a-z]+;", " ", t).strip() for t in texts
+            )
+            if len(text) > 100:
+                return text, "youtubetranscript.com", ""
+        errors.append(f"youtubetranscript.com: 파싱 실패")
+    except Exception as e:
+        errors.append(f"youtubetranscript.com: {e}")
+
+    return "", "failed", " | ".join(errors)
 
 # ── API 키 로딩 (Gemini) ─────────────────────────────────────────────────────
 def get_api_key() -> str:
@@ -526,11 +599,18 @@ def main():
         st.error("올바른 YouTube URL을 입력해주세요.")
         return
 
-    with st.spinner("📥 자막 불러오는 중..."):
-        transcript, method = get_transcript(video_id)
+    with st.spinner("📥 자막 불러오는 중... (최대 30초)"):
+        transcript, method, t_err = get_transcript(video_id)
 
     if not transcript:
-        st.error("자막을 가져오지 못했습니다. 영어 자막이 있는 영상으로 다시 시도해주세요.")
+        st.error(
+            "❌ 자막을 가져오지 못했습니다.\n\n"
+            "**시도한 방법별 오류:**\n```\n" + t_err + "\n```\n\n"
+            "**해결 방법:**\n"
+            "- 영어 자막(CC)이 켜진 영상인지 확인\n"
+            "- 영상 URL을 다시 복사해서 시도\n"
+            "- 유명 채널(TED, BBC, CNN 등) 영상으로 시도"
+        )
         return
 
     st.success(f"✅ 자막 취득 완료 ({method} · {len(transcript.split())}단어)")
