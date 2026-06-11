@@ -214,24 +214,43 @@ def analyze_with_claude(transcript: str) -> tuple[list[dict], list[dict], str]:
     }}
   ]
 }}"""
-    try:
+    # 429 대비: gemini-2.0-flash → gemini-1.5-flash → gemini-1.5-pro 순 폴백
+    MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    import time
+
+    for model in MODELS:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.0-flash:generateContent?key={api_key}"
+            f"{model}:generateContent?key={api_key}"
         )
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.2},
         }
-        r = requests.post(url, json=payload, timeout=60)
-        r.raise_for_status()
-        raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        raw = re.sub(r"^```[a-z]*", "", raw)
-        raw = re.sub(r"```$", "", raw).strip()
-        data = json.loads(raw)
-        return data.get("words", []), data.get("sentences", []), ""
-    except Exception as e:
-        return [], [], str(e)
+        for attempt in range(3):   # 같은 모델 최대 3회 재시도
+            try:
+                r = requests.post(url, json=payload, timeout=60)
+                if r.status_code == 429:
+                    # Retry-After 헤더 확인, 없으면 지수 대기
+                    wait = int(r.headers.get("Retry-After", 2 ** (attempt + 1)))
+                    wait = min(wait, 30)   # 최대 30초
+                    time.sleep(wait)
+                    continue               # 같은 모델 재시도
+                if r.status_code == 404:
+                    break                  # 모델 없음 → 다음 모델로
+                r.raise_for_status()
+                raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                raw = re.sub(r"^```[a-z]*", "", raw)
+                raw = re.sub(r"```$", "", raw).strip()
+                data = json.loads(raw)
+                return data.get("words", []), data.get("sentences", []), ""
+            except Exception as e:
+                last_err = str(e)
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                continue
+
+    return [], [], f"모든 모델 실패: {last_err}"
 
 # ── 인터랙티브 컴포넌트 HTML 생성 ────────────────────────────────────────────
 def build_component_html(words: list[dict], sentences: list[dict], video_id: str) -> str:
