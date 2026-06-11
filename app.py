@@ -87,10 +87,24 @@ def get_transcript(video_id: str) -> tuple[str, str]:
 
     return "", "failed"
 
+# ── API 키 로딩 ──────────────────────────────────────────────────────────────
+def get_api_key() -> str:
+    import os
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.environ.get("ANTHROPIC_API_KEY", "")
+
 # ── Claude 분석 ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
-def analyze_with_claude(transcript: str) -> tuple[list[dict], list[dict]]:
+def analyze_with_claude(transcript: str) -> tuple[list[dict], list[dict], str]:
     import anthropic
+    api_key = get_api_key()
+    if not api_key:
+        return [], [], "NO_KEY"
     sample = transcript[:6000]
     prompt = f"""아래는 YouTube 영상의 영어 자막입니다.
 
@@ -128,19 +142,19 @@ def analyze_with_claude(transcript: str) -> tuple[list[dict], list[dict]]:
   ]
 }}"""
     try:
-        client = anthropic.Anthropic()
+        client = anthropic.Anthropic(api_key=api_key)
         resp = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw)
+        raw = re.sub(r"^```[a-z]*", "", raw)
+        raw = re.sub(r"```$", "", raw).strip()
         data = json.loads(raw)
-        return data.get("words", []), data.get("sentences", [])
-    except Exception:
-        return [], []
+        return data.get("words", []), data.get("sentences", []), ""
+    except Exception as e:
+        return [], [], str(e)
 
 # ── 인터랙티브 컴포넌트 HTML 생성 ────────────────────────────────────────────
 def build_component_html(words: list[dict], sentences: list[dict], video_id: str) -> str:
@@ -518,11 +532,35 @@ def main():
     st.success(f"✅ 자막 취득 완료 ({method} · {len(transcript.split())}단어)")
 
     with st.spinner("🤖 Claude가 원어민 표현 분석 중..."):
-        words, sentences = analyze_with_claude(transcript)
+        words, sentences, err = analyze_with_claude(transcript)
+
+    if err == "NO_KEY":
+        st.error("""
+❌ **ANTHROPIC_API_KEY가 없습니다.**
+
+**Streamlit Cloud 배포 시:**
+1. 앱 대시보드 → Settings → Secrets
+2. 아래 내용 추가 후 저장:
+```
+ANTHROPIC_API_KEY = "sk-ant-..."
+```
+
+**로컬 실행 시:**
+`.streamlit/secrets.toml` 파일 생성:
+```
+ANTHROPIC_API_KEY = "sk-ant-..."
+```
+""")
+        return
+
+    if err:
+        st.error(f"❌ Claude API 오류: {err}")
+        return
 
     if not words and not sentences:
-        st.error("분석에 실패했습니다. ANTHROPIC_API_KEY를 확인해주세요.")
+        st.error("분석 결과가 없습니다. 다시 시도해주세요.")
         return
+
 
     # 인터랙티브 컴포넌트 렌더링 (TTS·음성인식 모두 여기서 동작)
     html = build_component_html(words, sentences, video_id)
