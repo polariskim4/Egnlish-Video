@@ -215,7 +215,7 @@ def analyze_with_claude(transcript: str) -> tuple[list[dict], list[dict], str]:
   ]
 }}"""
     # 429 대비: gemini-2.0-flash → gemini-1.5-flash → gemini-1.5-pro 순 폴백
-    MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    MODELS = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash"]
     import time
 
     last_err = "알 수 없는 오류"  # UnboundLocalError 방지
