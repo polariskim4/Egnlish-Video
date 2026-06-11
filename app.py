@@ -87,21 +87,21 @@ def get_transcript(video_id: str) -> tuple[str, str]:
 
     return "", "failed"
 
-# ── API 키 로딩 ──────────────────────────────────────────────────────────────
+# ── API 키 로딩 (Gemini) ─────────────────────────────────────────────────────
 def get_api_key() -> str:
     import os
     try:
-        key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        key = st.secrets.get("GEMINI_API_KEY", "")
         if key:
             return key
     except Exception:
         pass
-    return os.environ.get("ANTHROPIC_API_KEY", "")
+    return os.environ.get("GEMINI_API_KEY", "")
 
-# ── Claude 분석 ───────────────────────────────────────────────────────────────
+# ── Gemini 분석 ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
 def analyze_with_claude(transcript: str) -> tuple[list[dict], list[dict], str]:
-    import anthropic
+    import requests
     api_key = get_api_key()
     if not api_key:
         return [], [], "NO_KEY"
@@ -142,13 +142,17 @@ def analyze_with_claude(transcript: str) -> tuple[list[dict], list[dict], str]:
   ]
 }}"""
     try:
-        client = anthropic.Anthropic(api_key=api_key)
-        resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-1.5-flash:generateContent?key={api_key}"
         )
-        raw = resp.content[0].text.strip()
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.2},
+        }
+        r = requests.post(url, json=payload, timeout=60)
+        r.raise_for_status()
+        raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
         raw = re.sub(r"^```[a-z]*", "", raw)
         raw = re.sub(r"```$", "", raw).strip()
         data = json.loads(raw)
@@ -531,30 +535,33 @@ def main():
 
     st.success(f"✅ 자막 취득 완료 ({method} · {len(transcript.split())}단어)")
 
-    with st.spinner("🤖 Claude가 원어민 표현 분석 중..."):
+    with st.spinner("🤖 Gemini가 원어민 표현 분석 중..."):
         words, sentences, err = analyze_with_claude(transcript)
 
     if err == "NO_KEY":
         st.error("""
-❌ **ANTHROPIC_API_KEY가 없습니다.**
+❌ **GEMINI_API_KEY가 설정되지 않았습니다.**
+
+**🔑 무료 API 키 발급 (30초):**
+1. https://aistudio.google.com/app/apikey 접속 (구글 계정 필요)
+2. **Create API Key** 클릭 → 키 복사
 
 **Streamlit Cloud 배포 시:**
-1. 앱 대시보드 → Settings → Secrets
-2. 아래 내용 추가 후 저장:
+앱 대시보드 → Settings → Secrets 에 추가:
 ```
-ANTHROPIC_API_KEY = "sk-ant-..."
+GEMINI_API_KEY = "AIza..."
 ```
 
 **로컬 실행 시:**
 `.streamlit/secrets.toml` 파일 생성:
 ```
-ANTHROPIC_API_KEY = "sk-ant-..."
+GEMINI_API_KEY = "AIza..."
 ```
 """)
         return
 
     if err:
-        st.error(f"❌ Claude API 오류: {err}")
+        st.error(f"❌ Gemini API 오류: {err}")
         return
 
     if not words and not sentences:
