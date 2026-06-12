@@ -365,50 +365,96 @@ def build_component_html(words: list[dict], sentences: list[dict], video_id: str
 const WORDS = {words_json};
 const SENTS = {sents_json};
 
-// ── TTS ─────────────────────────────────────────────────────────────────────
+// ── TTS (모바일 완전 지원) ──────────────────────────────────────────────────
 let activeSpeakBtn = null;
+let iosKeepAlive = null;   // iOS speechSynthesis 멈춤 버그 방지 타이머
+let ttsUnlocked = false;   // 모바일 오디오 잠금 해제 여부
+
+// iOS/Android: 첫 유저 탭에서 오디오 컨텍스트 잠금 해제
+function unlockAudio() {{
+  if (ttsUnlocked) return;
+  ttsUnlocked = true;
+  // 빈 utterance로 AudioContext wake-up
+  const u = new SpeechSynthesisUtterance('');
+  u.volume = 0;
+  window.speechSynthesis.speak(u);
+  window.speechSynthesis.cancel();
+}}
+document.addEventListener('touchstart', unlockAudio, {{ once: true }});
+document.addEventListener('click', unlockAudio, {{ once: true }});
+
+function pickVoice() {{
+  const voices = window.speechSynthesis.getVoices();
+  // 모바일 우선순위: Google US > Samantha(iOS) > 일반 US > 영어
+  return voices.find(v => v.lang === 'en-US' && v.name.includes('Google'))
+      || voices.find(v => v.name === 'Samantha')          // iOS 기본 원어민
+      || voices.find(v => v.name.includes('Karen'))        // iOS 호주
+      || voices.find(v => v.lang === 'en-US')
+      || voices.find(v => v.lang.startsWith('en'))
+      || null;
+}}
+
+// 목소리 목록 미리 로드 (모바일은 느림)
+function loadVoices() {{
+  return new Promise(resolve => {{
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length > 0) {{ resolve(voices); return; }}
+    const timeout = setTimeout(() => resolve([]), 2000); // 최대 2초 대기
+    window.speechSynthesis.onvoiceschanged = () => {{
+      clearTimeout(timeout);
+      window.speechSynthesis.onvoiceschanged = null;
+      resolve(window.speechSynthesis.getVoices());
+    }};
+  }});
+}}
 
 function speakText(text, rate, btnEl) {{
-  // 진행 중 취소
+  // 진행 중 취소 + UI 초기화
   window.speechSynthesis.cancel();
+  if (iosKeepAlive) {{ clearInterval(iosKeepAlive); iosKeepAlive = null; }}
   if (activeSpeakBtn) {{
     activeSpeakBtn.classList.remove('playing');
     activeSpeakBtn = null;
   }}
 
-  const utter = new SpeechSynthesisUtterance(text);
-  utter.lang = 'en-US';
-  utter.rate = rate || 0.9;
+  loadVoices().then(() => {{
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = 'en-US';
+    utter.rate = rate || 0.9;
+    utter.volume = 1;
+    utter.pitch = 1;
 
-  // 최적 목소리 선택: Google US → 일반 US → 영어 계열
-  function pickVoice() {{
-    const voices = window.speechSynthesis.getVoices();
-    return voices.find(v => v.lang === 'en-US' && v.name.includes('Google'))
-        || voices.find(v => v.lang === 'en-US')
-        || voices.find(v => v.lang.startsWith('en'))
-        || null;
-  }}
-
-  function doSpeak() {{
     const v = pickVoice();
     if (v) utter.voice = v;
+
     if (btnEl) {{ btnEl.classList.add('playing'); activeSpeakBtn = btnEl; }}
-    utter.onend = utter.onerror = () => {{
+
+    utter.onstart = () => {{
+      // iOS Safari: speechSynthesis가 15초 후 자동 중단되는 버그 → resume() 주기 호출
+      iosKeepAlive = setInterval(() => {{
+        if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+      }}, 5000);
+    }};
+
+    utter.onend = () => {{
+      if (iosKeepAlive) {{ clearInterval(iosKeepAlive); iosKeepAlive = null; }}
       if (btnEl) btnEl.classList.remove('playing');
       if (activeSpeakBtn === btnEl) activeSpeakBtn = null;
     }};
-    window.speechSynthesis.speak(utter);
-  }}
-
-  // 목소리 목록이 아직 로드 안 된 경우 대기
-  if (window.speechSynthesis.getVoices().length === 0) {{
-    window.speechSynthesis.onvoiceschanged = () => {{
-      window.speechSynthesis.onvoiceschanged = null;
-      doSpeak();
+    utter.onerror = (e) => {{
+      if (iosKeepAlive) {{ clearInterval(iosKeepAlive); iosKeepAlive = null; }}
+      if (btnEl) btnEl.classList.remove('playing');
+      if (activeSpeakBtn === btnEl) activeSpeakBtn = null;
+      // 'interrupted' 는 정상 취소이므로 무시
+      if (e.error !== 'interrupted' && e.error !== 'canceled') {{
+        console.warn('TTS error:', e.error);
+      }}
     }};
-  }} else {{
-    doSpeak();
-  }}
+
+    // 모바일: resume() 먼저 호출해야 재생되는 경우 있음
+    window.speechSynthesis.resume();
+    window.speechSynthesis.speak(utter);
+  }});
 }}
 
 // ── 음성 인식 ────────────────────────────────────────────────────────────────
@@ -417,7 +463,8 @@ let activeRec = null;
 function startRec(target, type, btnEl, scoreId) {{
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) {{
-    alert('음성 인식은 Chrome 브라우저에서만 지원됩니다.');
+    const el = document.getElementById(scoreId);
+    if (el) el.innerHTML = '<div style="color:#ffa726;font-size:.82rem;margin-top:6px;">⚠️ 음성 인식: iOS는 Safari 앱에서만 지원됩니다.<br>Android는 Chrome 브라우저를 이용해주세요.</div>';
     return;
   }}
 
@@ -575,10 +622,20 @@ function renderSents() {{
 renderWords();
 renderSents();
 
-// 목소리 미리 로드
+// 목소리 미리 로드 (모바일은 DOMContentLoaded 후에도 늦게 로드됨)
 window.speechSynthesis.getVoices();
-if (typeof window.speechSynthesis.onvoiceschanged !== 'undefined')
-  window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+if (typeof window.speechSynthesis.onvoiceschanged !== 'undefined') {{
+  window.speechSynthesis.onvoiceschanged = () => {{
+    window.speechSynthesis.getVoices(); // 캐시 갱신
+  }};
+}}
+
+// 페이지 백그라운드→포그라운드 복귀 시 iOS speechSynthesis 재활성화
+document.addEventListener('visibilitychange', () => {{
+  if (!document.hidden) {{
+    window.speechSynthesis.cancel(); // 멈춤 상태 리셋
+  }}
+}});
 </script>
 </body>
 </html>"""
