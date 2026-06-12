@@ -255,6 +255,118 @@ def analyze_with_claude(transcript: str) -> tuple[list[dict], list[dict], str]:
     return [], [], f"모든 모델 실패 — {last_err}"
 
 # ── 인터랙티브 컴포넌트 HTML 생성 ────────────────────────────────────────────
+# ── TTS 브리지: Streamlit 메인 페이지에 inject (cross-origin iframe 우회) ─────
+# 안드로이드 크롬은 iframe 내부 speechSynthesis 완전 차단
+# → iframe에서 postMessage로 텍스트 전달 → 부모(Streamlit) 페이지에서 재생
+TTS_BRIDGE_JS = """
+<script>
+(function() {
+  // ── 중복 inject 방지 ──────────────────────────────────────────────────────
+  if (window.__ttsBridgeReady) return;
+  window.__ttsBridgeReady = true;
+
+  let iosTimer = null;
+  let activeBtn = null;   // 현재 재생 중인 버튼 참조(postMessage로 못 넘기므로 null)
+
+  function pickVoice() {
+    const vs = window.speechSynthesis.getVoices();
+    return vs.find(v => v.lang === 'en-US' && v.name.includes('Google'))
+        || vs.find(v => v.name === 'Samantha')
+        || vs.find(v => v.lang === 'en-US')
+        || vs.find(v => v.lang.startsWith('en'))
+        || null;
+  }
+
+  function doSpeak(text, rate) {
+    window.speechSynthesis.cancel();
+    if (iosTimer) { clearInterval(iosTimer); iosTimer = null; }
+
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang   = 'en-US';
+    u.rate   = rate  || 0.9;
+    u.volume = 1;
+    u.pitch  = 1;
+
+    // 목소리 로드 대기 (모바일 지연 대응)
+    function go() {
+      const v = pickVoice();
+      if (v) u.voice = v;
+      u.onstart = () => {
+        // iOS 15초 중단 버그 방지
+        iosTimer = setInterval(() => {
+          if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+        }, 5000);
+        // iframe에 재생 시작 알림
+        notifyIframe('tts_start');
+      };
+      u.onend = u.onerror = (e) => {
+        if (iosTimer) { clearInterval(iosTimer); iosTimer = null; }
+        notifyIframe('tts_end');
+        if (e.error && e.error !== 'interrupted' && e.error !== 'canceled')
+          console.warn('TTS:', e.error);
+      };
+      window.speechSynthesis.resume();
+      window.speechSynthesis.speak(u);
+    }
+
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length > 0) {
+      go();
+    } else {
+      const t = setTimeout(go, 200);
+      window.speechSynthesis.onvoiceschanged = () => {
+        window.speechSynthesis.onvoiceschanged = null;
+        clearTimeout(t); go();
+      };
+    }
+  }
+
+  function notifyIframe(type) {
+    // Streamlit component iframe에 메시지 전달
+    const frames = document.querySelectorAll('iframe');
+    frames.forEach(f => {
+      try { f.contentWindow.postMessage({ type }, '*'); } catch(e) {}
+    });
+  }
+
+  // ── iframe → 부모 메시지 수신 ──────────────────────────────────────────────
+  window.addEventListener('message', (e) => {
+    const d = e.data;
+    if (!d || typeof d !== 'object') return;
+    if (d.type === 'tts_speak') {
+      doSpeak(d.text, d.rate);
+    } else if (d.type === 'tts_stop') {
+      window.speechSynthesis.cancel();
+      if (iosTimer) { clearInterval(iosTimer); iosTimer = null; }
+      notifyIframe('tts_end');
+    }
+  });
+
+  // 첫 클릭/탭으로 오디오 잠금 해제 (모바일 필수)
+  function unlock() {
+    if (window.speechSynthesis) {
+      const u = new SpeechSynthesisUtterance('');
+      u.volume = 0;
+      window.speechSynthesis.speak(u);
+      window.speechSynthesis.cancel();
+    }
+  }
+  document.addEventListener('click',      unlock, { once: true });
+  document.addEventListener('touchstart', unlock, { once: true });
+
+  // visibilitychange: 백→포그라운드 복귀 시 리셋
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) window.speechSynthesis.cancel();
+  });
+
+  // 목소리 미리 로드
+  window.speechSynthesis.getVoices();
+  if (typeof window.speechSynthesis.onvoiceschanged !== 'undefined')
+    window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+})();
+</script>
+"""
+
 def build_component_html(words: list[dict], sentences: list[dict], video_id: str) -> str:
     words_json = json.dumps(words, ensure_ascii=False)
     sents_json = json.dumps(sentences, ensure_ascii=False)
@@ -281,7 +393,6 @@ def build_component_html(words: list[dict], sentences: list[dict], video_id: str
   .row {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:4px; }}
   .num {{ color:#7986cb; font-weight:700; min-width:22px; }}
   .korean {{ color:#a5d6a7; font-weight:700; font-size:.95rem; }}
-  .arrow {{ color:#3949ab; font-size:1.1rem; }}
   .ipa {{ color:#90caf9; font-size:.85rem; }}
   .why {{ color:#ffcc80; font-size:.8rem; margin:5px 0; }}
   .usage {{
@@ -290,14 +401,13 @@ def build_component_html(words: list[dict], sentences: list[dict], video_id: str
   }}
   .en-text {{ color:#cfd8dc; font-size:.88rem; margin:4px 0 8px; line-height:1.5; }}
 
-  /* 버튼 공통 */
   button {{ cursor:pointer; border:none; outline:none; }}
 
-  /* 발음 버튼 */
   .speak-btn {{
     background:#3949ab; color:#fff; border-radius:8px;
     padding:5px 13px; font-size:.9rem; font-weight:600;
     transition:background .15s;
+    -webkit-tap-highlight-color: transparent;
   }}
   .speak-btn:hover {{ background:#5c6bc0; }}
   .speak-btn:active {{ background:#283593; transform:scale(.97); }}
@@ -310,14 +420,13 @@ def build_component_html(words: list[dict], sentences: list[dict], video_id: str
     to   {{ box-shadow:0 0 0 8px #42a5f500; }}
   }}
 
-  /* 녹음 버튼 */
   .rec-btn {{
     background:#c62828; color:#fff;
-    border-radius:50%; width:40px; height:40px;
-    font-size:1.2rem; flex-shrink:0;
-    transition:background .15s;
+    border-radius:50%; width:44px; height:44px;
+    font-size:1.3rem; flex-shrink:0;
+    -webkit-tap-highlight-color: transparent;
   }}
-  .rec-btn:hover {{ background:#e53935; }}
+  .rec-btn:active {{ transform:scale(.93); }}
   .rec-btn.recording {{
     background:#b71c1c;
     animation:recPulse 1s ease infinite;
@@ -327,134 +436,65 @@ def build_component_html(words: list[dict], sentences: list[dict], video_id: str
     50%      {{ box-shadow:0 0 0 10px #c6282800; }}
   }}
 
-  /* 정확도 결과 */
   .score-wrap {{ margin-top:10px; }}
   .score-label {{ font-weight:700; font-size:.95rem; margin-bottom:3px; }}
-  .score-track {{
-    height:10px; border-radius:5px; background:#2d3250; overflow:hidden;
-  }}
+  .score-track {{ height:10px; border-radius:5px; background:#2d3250; overflow:hidden; }}
   .score-fill {{ height:10px; border-radius:5px; transition:width .6s ease; }}
   .score-spoken {{ color:#b0bec5; font-size:.78rem; margin-top:4px; }}
-
   .hint {{ color:#7986cb; font-size:.78rem; }}
-
   iframe {{ border-radius:10px; margin-bottom:16px; }}
 </style>
 </head>
 <body>
 
-<!-- 영상 임베드 -->
-<iframe width="100%" height="300"
+<iframe width="100%" height="240"
   src="https://www.youtube.com/embed/{video_id}"
   frameborder="0" allowfullscreen></iframe>
 
 <h2>📚 핵심 단어 TOP 10</h2>
 <p style="color:#7986cb;font-size:.8rem;margin-bottom:10px;">
-  🇰🇷 뜻 → 🇺🇸 단어 | 🔊 원어민 발음 | 🎤 따라하기
+  🇰🇷 뜻 → 🇺🇸 단어 | 🔊 발음 | 🎤 따라하기
 </p>
 <div id="words-container"></div>
 
-<h2 style="margin-top:28px;">💬 핵심 문장 TOP 10</h2>
+<h2 style="margin-top:24px;">💬 핵심 문장 TOP 10</h2>
 <p style="color:#7986cb;font-size:.8rem;margin-bottom:10px;">
-  🇰🇷 번역 → 🇺🇸 원문 | 🔊 원어민 발음 | 🎤 따라하기
+  🇰🇷 번역 → 🇺🇸 원문 | 🔊 발음 | 🎤 따라하기
 </p>
 <div id="sents-container"></div>
 
 <script>
-// ── 데이터 ──────────────────────────────────────────────────────────────────
 const WORDS = {words_json};
 const SENTS = {sents_json};
 
-// ── TTS (모바일 완전 지원) ──────────────────────────────────────────────────
-let activeSpeakBtn = null;
-let iosKeepAlive = null;   // iOS speechSynthesis 멈춤 버그 방지 타이머
-let ttsUnlocked = false;   // 모바일 오디오 잠금 해제 여부
-
-// iOS/Android: 첫 유저 탭에서 오디오 컨텍스트 잠금 해제
-function unlockAudio() {{
-  if (ttsUnlocked) return;
-  ttsUnlocked = true;
-  // 빈 utterance로 AudioContext wake-up
-  const u = new SpeechSynthesisUtterance('');
-  u.volume = 0;
-  window.speechSynthesis.speak(u);
-  window.speechSynthesis.cancel();
+// ── postMessage로 부모(Streamlit)에게 TTS 요청 ─────────────────────────────
+// 안드로이드 크롬: iframe 내부 speechSynthesis 차단 → 부모에서 실행
+function requestSpeak(text, rate) {{
+  window.parent.postMessage({{ type: 'tts_speak', text, rate }}, '*');
 }}
-document.addEventListener('touchstart', unlockAudio, {{ once: true }});
-document.addEventListener('click', unlockAudio, {{ once: true }});
-
-function pickVoice() {{
-  const voices = window.speechSynthesis.getVoices();
-  // 모바일 우선순위: Google US > Samantha(iOS) > 일반 US > 영어
-  return voices.find(v => v.lang === 'en-US' && v.name.includes('Google'))
-      || voices.find(v => v.name === 'Samantha')          // iOS 기본 원어민
-      || voices.find(v => v.name.includes('Karen'))        // iOS 호주
-      || voices.find(v => v.lang === 'en-US')
-      || voices.find(v => v.lang.startsWith('en'))
-      || null;
+function requestStop() {{
+  window.parent.postMessage({{ type: 'tts_stop' }}, '*');
 }}
 
-// 목소리 목록 미리 로드 (모바일은 느림)
-function loadVoices() {{
-  return new Promise(resolve => {{
-    const voices = window.speechSynthesis.getVoices();
-    if (voices.length > 0) {{ resolve(voices); return; }}
-    const timeout = setTimeout(() => resolve([]), 2000); // 최대 2초 대기
-    window.speechSynthesis.onvoiceschanged = () => {{
-      clearTimeout(timeout);
-      window.speechSynthesis.onvoiceschanged = null;
-      resolve(window.speechSynthesis.getVoices());
-    }};
-  }});
-}}
+// ── 부모로부터 TTS 상태 수신 → 버튼 UI 업데이트 ───────────────────────────
+let currentSpeakBtn = null;
+window.addEventListener('message', (e) => {{
+  if (!e.data || typeof e.data !== 'object') return;
+  if (e.data.type === 'tts_start') {{
+    if (currentSpeakBtn) currentSpeakBtn.classList.add('playing');
+  }} else if (e.data.type === 'tts_end') {{
+    if (currentSpeakBtn) currentSpeakBtn.classList.remove('playing');
+    currentSpeakBtn = null;
+  }}
+}});
 
 function speakText(text, rate, btnEl) {{
-  // 진행 중 취소 + UI 초기화
-  window.speechSynthesis.cancel();
-  if (iosKeepAlive) {{ clearInterval(iosKeepAlive); iosKeepAlive = null; }}
-  if (activeSpeakBtn) {{
-    activeSpeakBtn.classList.remove('playing');
-    activeSpeakBtn = null;
+  // 이전 버튼 초기화
+  if (currentSpeakBtn && currentSpeakBtn !== btnEl) {{
+    currentSpeakBtn.classList.remove('playing');
   }}
-
-  loadVoices().then(() => {{
-    const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = 'en-US';
-    utter.rate = rate || 0.9;
-    utter.volume = 1;
-    utter.pitch = 1;
-
-    const v = pickVoice();
-    if (v) utter.voice = v;
-
-    if (btnEl) {{ btnEl.classList.add('playing'); activeSpeakBtn = btnEl; }}
-
-    utter.onstart = () => {{
-      // iOS Safari: speechSynthesis가 15초 후 자동 중단되는 버그 → resume() 주기 호출
-      iosKeepAlive = setInterval(() => {{
-        if (window.speechSynthesis.paused) window.speechSynthesis.resume();
-      }}, 5000);
-    }};
-
-    utter.onend = () => {{
-      if (iosKeepAlive) {{ clearInterval(iosKeepAlive); iosKeepAlive = null; }}
-      if (btnEl) btnEl.classList.remove('playing');
-      if (activeSpeakBtn === btnEl) activeSpeakBtn = null;
-    }};
-    utter.onerror = (e) => {{
-      if (iosKeepAlive) {{ clearInterval(iosKeepAlive); iosKeepAlive = null; }}
-      if (btnEl) btnEl.classList.remove('playing');
-      if (activeSpeakBtn === btnEl) activeSpeakBtn = null;
-      // 'interrupted' 는 정상 취소이므로 무시
-      if (e.error !== 'interrupted' && e.error !== 'canceled') {{
-        console.warn('TTS error:', e.error);
-      }}
-    }};
-
-    // 모바일: resume() 먼저 호출해야 재생되는 경우 있음
-    window.speechSynthesis.resume();
-    window.speechSynthesis.speak(utter);
-  }});
+  currentSpeakBtn = btnEl;
+  requestSpeak(text, rate || 0.9);
 }}
 
 // ── 음성 인식 ────────────────────────────────────────────────────────────────
@@ -464,31 +504,24 @@ function startRec(target, type, btnEl, scoreId) {{
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) {{
     const el = document.getElementById(scoreId);
-    if (el) el.innerHTML = '<div style="color:#ffa726;font-size:.82rem;margin-top:6px;">⚠️ 음성 인식: iOS는 Safari 앱에서만 지원됩니다.<br>Android는 Chrome 브라우저를 이용해주세요.</div>';
+    if (el) el.innerHTML = '<div style="color:#ffa726;font-size:.82rem;margin-top:6px;">⚠️ 음성 인식: Android Chrome 또는 iOS Safari에서 지원됩니다.</div>';
     return;
   }}
-
-  // 이미 녹음 중이면 중지
   if (activeRec) {{
-    activeRec.stop();
-    activeRec = null;
-    if (btnEl) btnEl.classList.remove('recording');
+    activeRec.stop(); activeRec = null;
+    btnEl.classList.remove('recording');
     return;
   }}
-
   const rec = new SR();
   activeRec = rec;
   rec.lang = 'en-US';
   rec.continuous = false;
   rec.interimResults = false;
   rec.maxAlternatives = 1;
-
   btnEl.classList.add('recording');
-
   rec.onresult = (e) => {{
     const spoken = e.results[0][0].transcript.toLowerCase().trim();
-    const score  = calcScore(target.toLowerCase(), spoken, type);
-    showScore(scoreId, score, spoken);
+    showScore(scoreId, calcScore(target.toLowerCase(), spoken, type), spoken);
     btnEl.classList.remove('recording');
     activeRec = null;
   }};
@@ -498,147 +531,97 @@ function startRec(target, type, btnEl, scoreId) {{
     const el = document.getElementById(scoreId);
     if (el) el.innerHTML = '<div style="color:#ef5350;font-size:.82rem;margin-top:6px;">⚠️ 인식 오류: ' + e.error + '</div>';
   }};
-  rec.onend = () => {{
-    btnEl.classList.remove('recording');
-    activeRec = null;
-  }};
-
+  rec.onend = () => {{ btnEl.classList.remove('recording'); activeRec = null; }};
   rec.start();
 }}
 
-// ── 정확도 계산 ──────────────────────────────────────────────────────────────
+// ── 정확도 ───────────────────────────────────────────────────────────────────
 function levenshtein(a, b) {{
   const m = a.length, n = b.length;
-  const dp = Array.from({{length:m+1}}, (_,i) =>
-    Array.from({{length:n+1}}, (_,j) => i || j));
+  const dp = Array.from({{length:m+1}}, (_,i) => Array.from({{length:n+1}}, (_,j) => i||j));
   for (let i=1;i<=m;i++) for (let j=1;j<=n;j++)
-    dp[i][j] = a[i-1]===b[j-1] ? dp[i-1][j-1]
-             : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+    dp[i][j] = a[i-1]===b[j-1] ? dp[i-1][j-1] : 1+Math.min(dp[i-1][j],dp[i][j-1],dp[i-1][j-1]);
   return dp[m][n];
 }}
-
 function calcScore(target, spoken, type) {{
-  if (type === 'word') {{
-    const dist = levenshtein(target, spoken);
-    return Math.max(0, Math.round((1 - dist / Math.max(target.length, 1)) * 100));
-  }}
-  // 문장: F1 + 길이비율
-  const tw = target.replace(/[^a-z ]/g,'').split(/ +/).filter(Boolean);
-  const sw = spoken.replace(/[^a-z ]/g,'').split(/ +/).filter(Boolean);
+  if (type==='word') return Math.max(0,Math.round((1-levenshtein(target,spoken)/Math.max(target.length,1))*100));
+  const tw=target.replace(/[^a-z ]/g,'').split(/ +/).filter(Boolean);
+  const sw=spoken.replace(/[^a-z ]/g,'').split(/ +/).filter(Boolean);
   if (!tw.length) return 0;
-  const used = new Set();
-  let matched = 0;
+  const used=new Set(); let matched=0;
   for (const w of sw) {{
-    const idx = tw.findIndex((t,i) => !used.has(i) && (t===w || levenshtein(t,w)<=1));
-    if (idx !== -1) {{ matched++; used.add(idx); }}
+    const idx=tw.findIndex((t,i)=>!used.has(i)&&(t===w||levenshtein(t,w)<=1));
+    if (idx!==-1){{matched++;used.add(idx);}}
   }}
-  const rec  = matched / tw.length;
-  const prec = sw.length ? matched / sw.length : 0;
-  const f1   = rec+prec > 0 ? 2*rec*prec/(rec+prec) : 0;
-  const lenR = Math.min(sw.length, tw.length) / Math.max(sw.length, tw.length, 1);
-  return Math.min(100, Math.round((f1*.75 + lenR*.25) * 100));
+  const rec=matched/tw.length, prec=sw.length?matched/sw.length:0;
+  const f1=rec+prec>0?2*rec*prec/(rec+prec):0;
+  const lenR=Math.min(sw.length,tw.length)/Math.max(sw.length,tw.length,1);
+  return Math.min(100,Math.round((f1*.75+lenR*.25)*100));
 }}
-
 function showScore(id, score, spoken) {{
-  const el = document.getElementById(id);
-  if (!el) return;
-  const color = score>=80 ? '#66bb6a' : score>=50 ? '#ffa726' : '#ef5350';
-  el.innerHTML = `
-    <div class="score-wrap">
-      <div class="score-label" style="color:${{color}}">정확도: ${{score}}%</div>
-      <div class="score-track">
-        <div class="score-fill" style="width:${{score}}%;background:${{color}}"></div>
-      </div>
-      <div class="score-spoken">인식된 음성: "${{spoken}}"</div>
-    </div>`;
+  const el=document.getElementById(id); if (!el) return;
+  const c=score>=80?'#66bb6a':score>=50?'#ffa726':'#ef5350';
+  el.innerHTML=`<div class="score-wrap">
+    <div class="score-label" style="color:${{c}}">정확도: ${{score}}%</div>
+    <div class="score-track"><div class="score-fill" style="width:${{score}}%;background:${{c}}"></div></div>
+    <div class="score-spoken">인식된 음성: "${{spoken}}"</div>
+  </div>`;
 }}
 
-// ── 단어 카드 렌더링 ─────────────────────────────────────────────────────────
+// ── 카드 렌더링 ───────────────────────────────────────────────────────────────
 function renderWords() {{
-  const container = document.getElementById('words-container');
-  WORDS.forEach((w, i) => {{
-    const id = 'w' + i;
-    const scoreId = 'ws' + i;
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.innerHTML = `
+  const c=document.getElementById('words-container');
+  WORDS.forEach((w,i) => {{
+    const id='w'+i, sid='ws'+i;
+    const div=document.createElement('div');
+    div.className='card';
+    div.innerHTML=`
       <div class="row">
         <span class="num">${{i+1}}.</span>
         <span class="korean">🇰🇷 ${{w.korean}}</span>
-        <span class="arrow">→</span>
+        <span style="color:#3949ab">→</span>
         <button class="speak-btn" id="spk_${{id}}">🔊 ${{w.word}}</button>
-        <span class="ipa">${{w.ipa ? '[' + w.ipa + ']' : ''}}</span>
-        <button class="rec-btn" id="rec_${{id}}" title="클릭 후 따라 말하기">🎤</button>
-        <span class="hint">클릭 후 말하기</span>
+        <span class="ipa">${{w.ipa?'['+w.ipa+']':''}}</span>
+        <button class="rec-btn" id="rec_${{id}}">🎤</button>
+        <span class="hint">말하기</span>
       </div>
-      ${{w.why ? '<div class="why">💡 ' + w.why + '</div>' : ''}}
-      ${{w.usage ? '<div class="usage">📌 "' + w.usage + '"</div>' : ''}}
-      <div id="${{scoreId}}"></div>
-    `;
-    container.appendChild(card);
-
-    // 이벤트 — DOM 삽입 후 직접 바인딩 (onclick 문자열 없음)
-    document.getElementById('spk_' + id).addEventListener('click', function() {{
-      speakText(w.word, 0.9, this);
-    }});
-    document.getElementById('rec_' + id).addEventListener('click', function() {{
-      startRec(w.word, 'word', this, scoreId);
-    }});
+      ${{w.why?'<div class="why">💡 '+w.why+'</div>':''}}
+      ${{w.usage?'<div class="usage">📌 "'+w.usage+'"</div>':''}}
+      <div id="${{sid}}"></div>`;
+    c.appendChild(div);
+    document.getElementById('spk_'+id).addEventListener('click', function() {{ speakText(w.word, 0.9, this); }});
+    document.getElementById('rec_'+id).addEventListener('click', function() {{ startRec(w.word,'word',this,sid); }});
   }});
 }}
-
-// ── 문장 카드 렌더링 ─────────────────────────────────────────────────────────
 function renderSents() {{
-  const container = document.getElementById('sents-container');
-  SENTS.forEach((s, i) => {{
-    const id = 's' + i;
-    const scoreId = 'ss' + i;
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.style.borderLeft = '3px solid #5c6bc0';
-    card.innerHTML = `
+  const c=document.getElementById('sents-container');
+  SENTS.forEach((s,i) => {{
+    const id='s'+i, sid='ss'+i;
+    const div=document.createElement('div');
+    div.className='card';
+    div.style.borderLeft='3px solid #5c6bc0';
+    div.innerHTML=`
       <div class="korean">🇰🇷 ${{s.ko}}</div>
       <div class="en-text">🇺🇸 ${{s.en}}</div>
-      ${{s.why ? '<div class="why">💡 ' + s.why + '</div>' : ''}}
+      ${{s.why?'<div class="why">💡 '+s.why+'</div>':''}}
       <div class="row" style="margin-top:8px;">
         <button class="speak-btn" id="spk_${{id}}">🔊 원어민 발음</button>
-        <button class="rec-btn" id="rec_${{id}}" title="클릭 후 따라 말하기">🎤</button>
-        <span class="hint">클릭 후 말하기</span>
+        <button class="rec-btn" id="rec_${{id}}">🎤</button>
+        <span class="hint">말하기</span>
       </div>
-      <div id="${{scoreId}}"></div>
-    `;
-    container.appendChild(card);
-
-    document.getElementById('spk_' + id).addEventListener('click', function() {{
-      speakText(s.en, 0.85, this);
-    }});
-    document.getElementById('rec_' + id).addEventListener('click', function() {{
-      startRec(s.en, 'sentence', this, scoreId);
-    }});
+      <div id="${{sid}}"></div>`;
+    c.appendChild(div);
+    document.getElementById('spk_'+id).addEventListener('click', function() {{ speakText(s.en, 0.85, this); }});
+    document.getElementById('rec_'+id).addEventListener('click', function() {{ startRec(s.en,'sentence',this,sid); }});
   }});
 }}
 
-// ── 초기화 ───────────────────────────────────────────────────────────────────
 renderWords();
 renderSents();
-
-// 목소리 미리 로드 (모바일은 DOMContentLoaded 후에도 늦게 로드됨)
-window.speechSynthesis.getVoices();
-if (typeof window.speechSynthesis.onvoiceschanged !== 'undefined') {{
-  window.speechSynthesis.onvoiceschanged = () => {{
-    window.speechSynthesis.getVoices(); // 캐시 갱신
-  }};
-}}
-
-// 페이지 백그라운드→포그라운드 복귀 시 iOS speechSynthesis 재활성화
-document.addEventListener('visibilitychange', () => {{
-  if (!document.hidden) {{
-    window.speechSynthesis.cancel(); // 멈춤 상태 리셋
-  }}
-}});
 </script>
 </body>
 </html>"""
+
 
 # ── 메인 ─────────────────────────────────────────────────────────────────────
 def main():
@@ -653,9 +636,13 @@ def main():
 💡 YouTube 주소 입력 → 분석 시작 &nbsp;|&nbsp;
 🔊 발음 버튼 → 원어민 음성 재생 &nbsp;|&nbsp;
 🎤 버튼 → 클릭 후 따라 말하면 정확도 즉시 표시<br>
-⚠️ 음성 인식은 <b>Chrome 브라우저</b>에서만 작동합니다
+⚠️ 음성 인식은 <b>Chrome(Android) / Safari(iOS)</b>에서 지원됩니다
 </div>
 """, unsafe_allow_html=True)
+
+    # TTS 브리지: Streamlit 메인 페이지(부모)에 inject
+    # 안드로이드 크롬 cross-origin iframe speechSynthesis 차단 우회
+    st.markdown(TTS_BRIDGE_JS, unsafe_allow_html=True)
 
     col1, col2 = st.columns([5, 1])
     with col1:
@@ -726,10 +713,9 @@ GEMINI_API_KEY = "AIza..."
         st.error("분석 결과가 없습니다. 다시 시도해주세요.")
         return
 
-
-    # 인터랙티브 컴포넌트 렌더링 (TTS·음성인식 모두 여기서 동작)
+    # 인터랙티브 컴포넌트 (카드 UI + postMessage TTS 요청)
     html = build_component_html(words, sentences, video_id)
-    components.html(html, height=1800, scrolling=True)
+    components.html(html, height=1900, scrolling=True)
 
 
 if __name__ == "__main__":
