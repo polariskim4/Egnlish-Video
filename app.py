@@ -1,6 +1,5 @@
 import streamlit as st
-import streamlit.components.v1 as components
-import re, json, os, textwrap
+import re, json, os, base64
 
 st.set_page_config(page_title="YouTube 영어 학습기", page_icon="🎓", layout="wide")
 st.markdown("""
@@ -13,28 +12,21 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── 커스텀 컴포넌트 등록 (allow="autoplay; microphone" iframe 생성) ─────────
-COMPONENT_DIR = os.path.join(os.path.dirname(__file__), "tts_component")
-os.makedirs(COMPONENT_DIR, exist_ok=True)
-
-# ── YouTube ID ─────────────────────────────────────────────────────────────────
 def extract_video_id(url):
     for p in [r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})",r"^([A-Za-z0-9_-]{11})$"]:
         m=re.search(p,url)
         if m: return m.group(1)
     return None
 
-# ── VTT 파싱 ──────────────────────────────────────────────────────────────────
 def parse_vtt_text(raw):
-    seen,out=[],[]
+    seen,out=set(),[]
     for line in raw.splitlines():
         line=line.strip()
         if not line or "-->" in line or line.startswith("WEBVTT") or re.match(r"^\d+$",line): continue
         line=re.sub(r"<[^>]+>","",line)
-        if line and line not in seen: seen.append(line);out.append(line)
+        if line and line not in seen: seen.add(line);out.append(line)
     return " ".join(out)
 
-# ── 자막 취득 ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600,show_spinner=False)
 def get_transcript(video_id):
     errors=[]
@@ -59,7 +51,8 @@ def get_transcript(video_id):
         opts={"skip_download":True,"writeautomaticsub":True,"writesubtitles":True,
               "subtitleslangs":["en","en-US","en-GB"],"subtitlesformat":"vtt",
               "outtmpl":os.path.join(tmp,"sub_%(id)s.%(ext)s"),"quiet":True,"no_warnings":True,
-              "socket_timeout":30,"http_headers":{"User-Agent":"com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"},
+              "socket_timeout":30,
+              "http_headers":{"User-Agent":"com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"},
               "extractor_args":{"youtube":{"player_client":["android","web"]}}}
         with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
         vtt_files=glob.glob(os.path.join(tmp,f"sub_{video_id}*.vtt"))
@@ -80,7 +73,6 @@ def get_transcript(video_id):
     except Exception as e: errors.append(f"supadata:{e}")
     return "","failed"," | ".join(errors)
 
-# ── API 키 ─────────────────────────────────────────────────────────────────────
 def get_api_key():
     try:
         k=st.secrets.get("GEMINI_API_KEY","")
@@ -88,7 +80,6 @@ def get_api_key():
     except: pass
     return os.environ.get("GEMINI_API_KEY","")
 
-# ── Gemini 분석 ────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400,show_spinner=False)
 def analyze_transcript(transcript):
     import requests,time
@@ -97,15 +88,16 @@ def analyze_transcript(transcript):
     prompt=f"""아래는 YouTube 영상의 영어 자막입니다.
 <transcript>{transcript[:6000]}</transcript>
 다음 두 가지를 분석해 JSON으로만 응답 (마크다운 코드블록 없이 순수 JSON).
-단어 10개: ❌기초어휘 제외 ✅구동사·관용구·콜로케이션·원어민구어
-문장 10개: ❌단순구조 제외 ✅도치·분열문·구어체생략·원어민연결어
+단어 10개: 기초어휘 제외, 구동사·관용구·콜로케이션·원어민구어 포함
+문장 10개: 단순구조 제외, 도치·분열문·구어체생략·원어민연결어 포함
 {{"words":[{{"word":"","ipa":"","korean":"","usage":"","why":""}}],
   "sentences":[{{"en":"","ko":"","why":""}}]}}"""
     MODELS=["gemini-3.5-flash","gemini-3.1-flash-lite","gemini-2.5-flash"]
     last_err="알 수 없는 오류"
     for model in MODELS:
         url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        payload={"contents":[{"parts":[{"text":prompt}]}],"generationConfig":{"maxOutputTokens":2000,"temperature":0.2}}
+        payload={"contents":[{"parts":[{"text":prompt}]}],
+                 "generationConfig":{"maxOutputTokens":2000,"temperature":0.2}}
         for attempt in range(3):
             try:
                 r=requests.post(url,json=payload,timeout=60)
@@ -123,36 +115,45 @@ def analyze_transcript(transcript):
                 if attempt<2: time.sleep(2**attempt)
     return [],[],f"모든 모델 실패—{last_err}"
 
-# ── 커스텀 컴포넌트 HTML 파일 생성 ────────────────────────────────────────────
-def write_component(words, sentences, video_id):
-    wj=json.dumps(words,ensure_ascii=False)
-    sj=json.dumps(sentences,ensure_ascii=False)
+# ── 핵심: data URI iframe ──────────────────────────────────────────────────────
+# components.html() 대신 st.markdown()으로 <iframe srcdoc="..."> 를 직접 삽입
+# srcdoc iframe은 부모와 same-origin으로 취급 → speechSynthesis 정상 동작
+def render_player(words, sentences, video_id):
+    wj = json.dumps(words, ensure_ascii=False)
+    sj = json.dumps(sentences, ensure_ascii=False)
 
-    html=textwrap.dedent(f"""\
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="UTF-8">
+    # srcdoc에 들어갈 HTML (따옴표를 HTML 엔티티로 이스케이프)
+    inner = f"""<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
-body{{background:#0f1117;color:#e8eaf6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:12px;}}
-h2{{color:#90caf9;font-size:1.05rem;font-weight:700;border-bottom:2px solid #3949ab;padding-bottom:5px;margin:18px 0 10px;}}
-.card{{background:#1e2130;border-radius:12px;padding:13px 16px;margin:9px 0;border:1px solid #2d3250;}}
+html,body{{height:100%;}}
+body{{background:#0f1117;color:#e8eaf6;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  padding:14px;overflow-y:auto;}}
+h2{{color:#90caf9;font-size:1.05rem;font-weight:700;
+  border-bottom:2px solid #3949ab;padding-bottom:5px;margin:18px 0 10px;}}
+.card{{background:#1e2130;border-radius:12px;padding:13px 16px;
+  margin:9px 0;border:1px solid #2d3250;}}
 .sent{{border-left:3px solid #5c6bc0;}}
 .row{{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:3px;}}
 .num{{color:#7986cb;font-weight:700;min-width:20px;}}
 .kor{{color:#a5d6a7;font-weight:700;font-size:.93rem;}}
 .ipa{{color:#90caf9;font-size:.82rem;}}
 .why{{color:#ffcc80;font-size:.79rem;margin:4px 0;}}
-.usage{{background:#0d1021;border-radius:6px;padding:4px 9px;color:#90caf9;font-size:.8rem;font-style:italic;margin-top:3px;}}
+.usage{{background:#0d1021;border-radius:6px;padding:4px 9px;
+  color:#90caf9;font-size:.8rem;font-style:italic;margin-top:3px;}}
 .en{{color:#cfd8dc;font-size:.87rem;margin:3px 0 7px;line-height:1.5;}}
-button{{cursor:pointer;border:none;outline:none;-webkit-tap-highlight-color:transparent;touch-action:manipulation;}}
-.spk{{background:#3949ab;color:#fff;border-radius:8px;padding:6px 13px;font-size:.88rem;font-weight:600;}}
+button{{cursor:pointer;border:none;outline:none;
+  -webkit-tap-highlight-color:transparent;touch-action:manipulation;}}
+.spk{{background:#3949ab;color:#fff;border-radius:8px;
+  padding:6px 13px;font-size:.88rem;font-weight:600;}}
 .spk:active{{background:#283593;transform:scale(.96);}}
 .spk.playing{{background:#1565c0;animation:sp .7s ease infinite alternate;}}
 @keyframes sp{{from{{box-shadow:0 0 0 0 #42a5f566;}}to{{box-shadow:0 0 0 9px #42a5f500;}}}}
-.rec{{background:#c62828;color:#fff;border-radius:50%;width:42px;height:42px;font-size:1.2rem;flex-shrink:0;}}
+.rec{{background:#c62828;color:#fff;border-radius:50%;
+  width:42px;height:42px;font-size:1.2rem;flex-shrink:0;}}
 .rec:active{{transform:scale(.91);}}
 .rec.on{{background:#b71c1c;animation:rp 1s ease infinite;}}
 @keyframes rp{{0%,100%{{box-shadow:0 0 0 0 #c6282855;}}50%{{box-shadow:0 0 0 9px #c6282800;}}}}
@@ -162,28 +163,27 @@ button{{cursor:pointer;border:none;outline:none;-webkit-tap-highlight-color:tran
 .sf{{height:9px;border-radius:4px;transition:width .5s ease;}}
 .ss{{color:#b0bec5;font-size:.77rem;margin-top:3px;}}
 .hint{{color:#7986cb;font-size:.76rem;}}
-yt-frame{{display:block;width:100%;border-radius:10px;margin-bottom:14px;}}
-</style>
-</head>
-<body>
+</style></head><body>
 
-<iframe width="100%" height="220" style="border-radius:10px;margin-bottom:14px;display:block;"
-  src="https://www.youtube.com/embed/{video_id}" frameborder="0" allowfullscreen></iframe>
+<iframe width="100%" height="200"
+  style="border-radius:10px;margin-bottom:14px;display:block;border:none;"
+  src="https://www.youtube.com/embed/{video_id}"
+  allowfullscreen></iframe>
 
 <h2>📚 핵심 단어 TOP 10</h2>
-<p style="color:#7986cb;font-size:.79rem;margin-bottom:9px;">🇰🇷 뜻 → 🇺🇸 단어 | 🔊 발음 | 🎤 따라하기</p>
+<p style="color:#7986cb;font-size:.79rem;margin-bottom:9px;">
+  🇰🇷 뜻 → 🇺🇸 단어 | 🔊 발음 | 🎤 따라하기</p>
 <div id="wc"></div>
-<h2 style="margin-top:22px;">💬 핵심 문장 TOP 10</h2>
-<p style="color:#7986cb;font-size:.79rem;margin-bottom:9px;">🇰🇷 번역 → 🇺🇸 원문 | 🔊 발음 | 🎤 따라하기</p>
+<h2 style="margin-top:20px;">💬 핵심 문장 TOP 10</h2>
+<p style="color:#7986cb;font-size:.79rem;margin-bottom:9px;">
+  🇰🇷 번역 → 🇺🇸 원문 | 🔊 발음 | 🎤 따라하기</p>
 <div id="sc"></div>
 
 <script>
 var WORDS={wj};
 var SENTS={sj};
-
-/* ── TTS ─────────────────────────────────────────────────────────────────── */
 var syn=window.speechSynthesis;
-var iosT=null, curBtn=null;
+var iosT=null,curBtn=null;
 
 function getVoice(){{
   var vs=syn.getVoices();
@@ -198,8 +198,8 @@ function doSpeak(text,rate){{
   syn.cancel();
   if(iosT){{clearInterval(iosT);iosT=null;}}
   var u=new SpeechSynthesisUtterance(text);
-  u.lang='en-US'; u.rate=rate||0.9; u.volume=1; u.pitch=1;
-  var v=getVoice(); if(v) u.voice=v;
+  u.lang='en-US';u.rate=rate||0.9;u.volume=1;u.pitch=1;
+  var v=getVoice();if(v)u.voice=v;
   u.onstart=function(){{
     iosT=setInterval(function(){{if(syn.paused)syn.resume();}},5000);
   }};
@@ -212,58 +212,58 @@ function doSpeak(text,rate){{
 }}
 
 function speak(text,rate,btn){{
-  if(curBtn&&curBtn!==btn) curBtn.classList.remove('playing');
-  curBtn=btn; btn.classList.add('playing');
+  if(curBtn&&curBtn!==btn)curBtn.classList.remove('playing');
+  curBtn=btn;btn.classList.add('playing');
   var vs=syn.getVoices();
   if(vs.length>0){{doSpeak(text,rate);}}
   else{{
-    var tid=setTimeout(function(){{doSpeak(text,rate);}},300);
-    syn.onvoiceschanged=function(){{syn.onvoiceschanged=null;clearTimeout(tid);doSpeak(text,rate);}};
+    var tid=setTimeout(function(){{doSpeak(text,rate);}},400);
+    syn.onvoiceschanged=function(){{
+      syn.onvoiceschanged=null;clearTimeout(tid);doSpeak(text,rate);
+    }};
   }}
 }}
 
-/* ── 음성인식 ────────────────────────────────────────────────────────────── */
 var activeRec=null;
 function startRec(target,type,btn,sid){{
   var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
   if(!SR){{
     var el=document.getElementById(sid);
-    if(el) el.innerHTML='<div style="color:#ffa726;font-size:.8rem;margin-top:5px;">⚠️ Android Chrome 또는 iOS Safari 필요</div>';
+    if(el)el.innerHTML='<div style="color:#ffa726;font-size:.8rem;margin-top:5px;">⚠️ Android Chrome 또는 iOS Safari 필요</div>';
     return;
   }}
   if(activeRec){{activeRec.stop();activeRec=null;btn.classList.remove('on');return;}}
-  var rec=new SR(); activeRec=rec;
-  rec.lang='en-US'; rec.continuous=false; rec.interimResults=false;
+  var rec=new SR();activeRec=rec;
+  rec.lang='en-US';rec.continuous=false;rec.interimResults=false;
   btn.classList.add('on');
   rec.onresult=function(e){{
     var spoken=e.results[0][0].transcript.toLowerCase().trim();
     showScore(sid,calcScore(target.toLowerCase(),spoken,type),spoken);
-    btn.classList.remove('on'); activeRec=null;
+    btn.classList.remove('on');activeRec=null;
   }};
   rec.onerror=function(e){{
-    btn.classList.remove('on'); activeRec=null;
+    btn.classList.remove('on');activeRec=null;
     var el=document.getElementById(sid);
-    if(el) el.innerHTML='<div style="color:#ef5350;font-size:.8rem;margin-top:5px;">⚠️ 오류:'+e.error+'</div>';
+    if(el)el.innerHTML='<div style="color:#ef5350;font-size:.8rem;margin-top:5px;">⚠️ 오류:'+e.error+'</div>';
   }};
   rec.onend=function(){{btn.classList.remove('on');activeRec=null;}};
   rec.start();
 }}
 
-/* ── 정확도 ──────────────────────────────────────────────────────────────── */
 function lev(a,b){{
   var m=a.length,n=b.length,dp=[],i,j;
-  for(i=0;i<=m;i++){{dp[i]=[];for(j=0;j<=n;j++) dp[i][j]=i?j?0:i:j;}}
-  for(i=1;i<=m;i++) for(j=1;j<=n;j++)
+  for(i=0;i<=m;i++){{dp[i]=[];for(j=0;j<=n;j++)dp[i][j]=i?j?0:i:j;}}
+  for(i=1;i<=m;i++)for(j=1;j<=n;j++)
     dp[i][j]=a[i-1]===b[j-1]?dp[i-1][j-1]:1+Math.min(dp[i-1][j],dp[i][j-1],dp[i-1][j-1]);
   return dp[m][n];
 }}
 function calcScore(t,s,type){{
-  if(type==='word') return Math.max(0,Math.round((1-lev(t,s)/Math.max(t.length,1))*100));
+  if(type==='word')return Math.max(0,Math.round((1-lev(t,s)/Math.max(t.length,1))*100));
   var tw=t.replace(/[^a-z ]/g,'').split(' ').filter(Boolean);
   var sw=s.replace(/[^a-z ]/g,'').split(' ').filter(Boolean);
-  if(!tw.length) return 0;
+  if(!tw.length)return 0;
   var used={{}},matched=0,i,j;
-  for(i=0;i<sw.length;i++) for(j=0;j<tw.length;j++)
+  for(i=0;i<sw.length;i++)for(j=0;j<tw.length;j++)
     if(!used[j]&&(tw[j]===sw[i]||lev(tw[j],sw[i])<=1)){{matched++;used[j]=1;break;}}
   var rc=matched/tw.length,pr=sw.length?matched/sw.length:0;
   var f1=rc+pr>0?2*rc*pr/(rc+pr):0;
@@ -271,14 +271,13 @@ function calcScore(t,s,type){{
   return Math.min(100,Math.round((f1*.75+lr*.25)*100));
 }}
 function showScore(id,sc,spoken){{
-  var el=document.getElementById(id); if(!el) return;
+  var el=document.getElementById(id);if(!el)return;
   var c=sc>=80?'#66bb6a':sc>=50?'#ffa726':'#ef5350';
   el.innerHTML='<div class="sw"><div class="sl" style="color:'+c+'">정확도: '+sc+'%</div>'
     +'<div class="st"><div class="sf" style="width:'+sc+'%;background:'+c+'"></div></div>'
     +'<div class="ss">인식: "'+spoken+'"</div></div>';
 }}
 
-/* ── 렌더링 ──────────────────────────────────────────────────────────────── */
 function renderWords(){{
   var c=document.getElementById('wc');
   WORDS.forEach(function(w,i){{
@@ -319,21 +318,25 @@ function renderSents(){{
   }});
 }}
 
-/* ── 초기화 ──────────────────────────────────────────────────────────────── */
-renderWords(); renderSents();
+renderWords();renderSents();
 syn.getVoices();
 if(typeof syn.onvoiceschanged!=='undefined')
   syn.onvoiceschanged=function(){{syn.getVoices();}};
 document.addEventListener('visibilitychange',function(){{if(!document.hidden)syn.cancel();}});
-</script>
-</body></html>""")
+</script></body></html>"""
 
-    path=os.path.join(COMPONENT_DIR,"index.html")
-    with open(path,"w",encoding="utf-8") as f: f.write(html)
-    return path
+    # srcdoc 방식: HTML을 속성값으로 직접 삽입
+    # &quot; 이스케이프로 따옴표 충돌 방지
+    srcdoc = inner.replace('"', '&quot;')
 
-# ── 커스텀 컴포넌트 선언 ───────────────────────────────────────────────────────
-tts_component=components.declare_component("tts_player",path=COMPONENT_DIR)
+    st.markdown(
+        f'<iframe srcdoc="{srcdoc}" '
+        f'width="100%" height="1900" '
+        f'style="border:none;border-radius:12px;" '
+        f'allow="autoplay; microphone; clipboard-write" '
+        f'scrolling="yes"></iframe>',
+        unsafe_allow_html=True
+    )
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 def main():
@@ -344,8 +347,8 @@ def main():
     st.markdown("""
 <div style="background:#1a237e22;border:1px solid #3949ab55;border-radius:10px;
   padding:12px 16px;margin-bottom:16px;font-size:.88rem;color:#b0bec5;">
-💡 YouTube 주소 입력 → 분석 시작 | 🔊 발음 | 🎤 따라 말하기 → 정확도 표시<br>
-⚠️ 음성 인식: <b>Chrome(PC/Android)</b> 또는 <b>Safari(iOS)</b>
+💡 YouTube 주소 입력 → 분석 시작 | 🔊 발음 | 🎤 따라 말하기 → 정확도<br>
+⚠️ 음성인식: <b>Chrome(PC/Android)</b> 또는 <b>Safari(iOS)</b>
 </div>""", unsafe_allow_html=True)
 
     col1,col2=st.columns([5,1])
@@ -366,22 +369,17 @@ def main():
     with st.spinner("📥 자막 불러오는 중..."):
         transcript,method,t_err=get_transcript(video_id)
     if not transcript:
-        st.error("❌ 자막 취득 실패\n\n```\n"+t_err+"\n```\n\nTED·BBC·CNN 등 영어 자막 있는 영상으로 시도해보세요."); return
+        st.error("❌ 자막 취득 실패\n\n```\n"+t_err+"\n```"); return
     st.success(f"✅ 자막 취득 완료 ({method} · {len(transcript.split())}단어)")
 
-    with st.spinner("🤖 Gemini가 원어민 표현 분석 중..."):
+    with st.spinner("🤖 Gemini 분석 중..."):
         words,sentences,err=analyze_transcript(transcript)
     if err=="NO_KEY":
-        st.error("❌ GEMINI_API_KEY 미설정\nhttps://aistudio.google.com/app/apikey 에서 발급 후\n"
-                 "Streamlit Cloud Secrets에 추가:\n```\nGEMINI_API_KEY = \"AIza...\"\n```"); return
+        st.error("❌ GEMINI_API_KEY 미설정\nhttps://aistudio.google.com/app/apikey 발급 후\nSecrets에 추가:\n```\nGEMINI_API_KEY=\"AIza...\"\n```"); return
     if err: st.error(f"❌ Gemini API 오류: {err}"); return
-    if not words and not sentences: st.error("분석 결과가 없습니다. 다시 시도해주세요."); return
+    if not words and not sentences: st.error("분석 결과 없음. 다시 시도해주세요."); return
 
-    # HTML 파일 생성 후 커스텀 컴포넌트로 렌더링
-    # declare_component(path=...) 는 해당 디렉토리의 index.html을 서빙
-    # → 같은 origin으로 iframe 생성 → speechSynthesis 차단 없음
-    write_component(words, sentences, video_id)
-    tts_component(height=1900, scrolling=True)
+    render_player(words, sentences, video_id)
 
 if __name__=="__main__":
     main()
